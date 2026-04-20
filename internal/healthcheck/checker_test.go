@@ -11,6 +11,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type noopLogger struct{}
+
+func (noopLogger) Debugf(string, ...any) {}
+func (noopLogger) Info(string)           {}
+func (noopLogger) Infof(string, ...any)  {}
+func (noopLogger) Warnf(string, ...any)  {}
+func (noopLogger) Error(string)          {}
+
 func Test_Checker_fullcheck(t *testing.T) {
 	t.Parallel()
 
@@ -32,6 +40,32 @@ func Test_Checker_fullcheck(t *testing.T) {
 
 		require.Error(t, err)
 		assert.EqualError(t, err, "TCP+TLS dial: context canceled")
+	})
+
+	// Regression: without the len(c.tlsDialAddrs) == 0 guard, `try % 0`
+	// panics with "runtime error: integer divide by zero" — observed in
+	// production when fullPeriodicCheck fires before config-apply has
+	// populated tlsDialAddrs. The guard must return a descriptive error
+	// without panicking so the outer withRetries wrapper can log and the
+	// healthcheck goroutine can survive to the next tick.
+	t.Run("empty tlsDialAddrs does not panic", func(t *testing.T) {
+		t.Parallel()
+
+		dialer := &net.Dialer{}
+		checker := &Checker{
+			dialer:       dialer,
+			tlsDialAddrs: nil,
+			logger:       noopLogger{},
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		assert.NotPanics(t, func() {
+			err := checker.fullPeriodicCheck(ctx)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "no TLS dial addresses configured")
+		})
 	})
 
 	t.Run("dial localhost:0", func(t *testing.T) {
@@ -60,6 +94,48 @@ func Test_Checker_fullcheck(t *testing.T) {
 
 		assert.NoError(t, err)
 	})
+}
+
+func Test_smallCheckTypeToString(t *testing.T) {
+	t.Parallel()
+
+	testCases := map[string]struct {
+		input    string
+		expected string
+	}{
+		"icmp": {
+			input:    smallCheckICMP,
+			expected: "ICMP echo",
+		},
+		"dns": {
+			input:    smallCheckDNS,
+			expected: "plain DNS over UDP",
+		},
+		// Regression: without the `default:` placeholder return, this
+		// `panic(...)` in the default arm kills the whole container when
+		// the Go zero-value "" reaches the function during startup races
+		// or config-apply reorderings.
+		"zero-value does not panic": {
+			input:    "",
+			expected: "unknown()",
+		},
+		"unknown token does not panic": {
+			input:    "bogus",
+			expected: "unknown(bogus)",
+		},
+	}
+
+	for name, testCase := range testCases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var got string
+			assert.NotPanics(t, func() {
+				got = smallCheckTypeToString(testCase.input)
+			})
+			assert.Equal(t, testCase.expected, got)
+		})
+	}
 }
 
 func Test_makeAddressToDial(t *testing.T) {
