@@ -206,6 +206,14 @@ func (c *Checker) fullPeriodicCheck(ctx context.Context) error {
 	// See https://github.com/qdm12/gluetun/issues/2270
 	tryTimeouts := []time.Duration{10 * time.Second, 15 * time.Second, 30 * time.Second}
 	check := func(ctx context.Context, try int) error {
+		// Guard against empty tlsDialAddrs — the slice's Go zero-value is
+		// nil, and len(nil) == 0 would make `try % 0` panic with
+		// runtime error: integer divide by zero. Observed in production
+		// when the periodic check fires before config-apply populates
+		// tlsDialAddrs, or during a reconfigure race.
+		if len(c.tlsDialAddrs) == 0 {
+			return errors.New("fullPeriodicCheck: no TLS dial addresses configured")
+		}
 		tlsDialAddr := c.tlsDialAddrs[try%len(c.tlsDialAddrs)]
 		return tcpTLSCheck(ctx, c.dialer, tlsDialAddr)
 	}
@@ -357,6 +365,12 @@ func smallCheckTypeToString(smallCheckType string) string {
 	case smallCheckDNS:
 		return "plain DNS over UDP"
 	default:
-		panic("unknown small check type: " + smallCheckType)
+		// The field's zero-value "" can reach here during startup races
+		// or config-apply reorderings (observed in production on multiple
+		// containers — one healthcheck goroutine panic takes the whole
+		// container down). The returned string is purely for log
+		// formatting; returning a placeholder is safe and preserves
+		// visibility in logs.
+		return "unknown(" + smallCheckType + ")"
 	}
 }
